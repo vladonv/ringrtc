@@ -143,6 +143,17 @@ pub struct RffiAudioConfigWrapper {
     adm: Option<Arc<Mutex<AudioDeviceModule>>>,
 }
 
+/// Milestone D (see /home/vlad/.claude/plans/jiggly-mapping-plum.md): a
+/// second RffiAudioConfig-building path using RawPcmAudioDeviceModule
+/// (no cubeb, no real sound device) instead of AudioDeviceModule -
+/// deliberately a parallel struct rather than making RffiAudioConfigWrapper
+/// generic, so the existing cubeb-backed path above is untouched.
+#[cfg(all(not(feature = "sim"), feature = "native"))]
+pub struct RffiAudioConfigWrapperRawPcm {
+    rffi: RffiAudioConfig,
+    pub raw_pcm_adm: Option<Arc<Mutex<crate::webrtc::raw_pcm_audio_device_module::RawPcmAudioDeviceModule>>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioConfig {
     pub high_pass_filter_enabled: bool,
@@ -225,6 +236,50 @@ impl AudioConfig {
             },
             #[cfg(all(not(feature = "sim"), feature = "native"))]
             adm: adm_arc,
+        })
+    }
+
+    /// Milestone D: same shape as rffi() above, but backed by
+    /// RawPcmAudioDeviceModule instead of the cubeb-based AudioDeviceModule -
+    /// no OS audio device anywhere in the path. high_pass_filter/aec/ns/agc
+    /// are meaningless without a real acoustic path (same rationale as
+    /// tg2sip.conf's enable_aec/enable_ns/enable_agc defaults) but are kept
+    /// on self for symmetry with rffi().
+    #[cfg(all(not(feature = "sim"), feature = "native"))]
+    pub fn rffi_raw_pcm(&self) -> Result<RffiAudioConfigWrapperRawPcm> {
+        use crate::webrtc::raw_pcm_audio_device_module::{
+            RAW_PCM_AUDIO_DEVICE_CBS_PTR, RawPcmAudioDeviceModule, decrement_raw_pcm_adm_ref_count,
+        };
+
+        let (adm_borrowed, adm_arc) = match RawPcmAudioDeviceModule::new() {
+            Ok(adm) => {
+                let adm_arc = Arc::new(Mutex::new(adm));
+                (
+                    webrtc::ptr::Borrowed::from_ptr(Arc::<Mutex<RawPcmAudioDeviceModule>>::into_raw(
+                        adm_arc.clone(),
+                    ))
+                    .to_void(),
+                    Some(adm_arc),
+                )
+            }
+            Err(e) => {
+                error!("Failed to initialize raw pcm adm: {}", e);
+                (webrtc::ptr::Borrowed::null(), None)
+            }
+        };
+
+        Ok(RffiAudioConfigWrapperRawPcm {
+            rffi: RffiAudioConfig {
+                high_pass_filter_enabled: self.high_pass_filter_enabled,
+                aec_enabled: self.aec_enabled,
+                ns_enabled: self.ns_enabled,
+                agc_enabled: self.agc_enabled,
+                adm_borrowed,
+                rust_audio_device_callbacks: webrtc::ptr::Borrowed::from_ptr(RAW_PCM_AUDIO_DEVICE_CBS_PTR)
+                    .to_void(),
+                free_adm_cb: decrement_raw_pcm_adm_ref_count,
+            },
+            raw_pcm_adm: adm_arc,
         })
     }
 }
@@ -318,6 +373,53 @@ impl PeerConnectionFactory {
             #[cfg(all(not(feature = "sim"), feature = "native"))]
             adm: audio_config_rffi.adm,
         })
+    }
+
+    /// Milestone D: same as new(), but backed by RawPcmAudioDeviceModule
+    /// instead of the cubeb-based AudioDeviceModule - no OS audio device
+    /// anywhere in the path. Returns the factory plus a handle to push
+    /// outgoing ("microphone") PCM in and pull incoming ("speaker") PCM
+    /// out; the factory's own `adm` field stays None since none of the
+    /// device-selection APIs that field backs (get/set playout device
+    /// etc.) apply to a virtual device.
+    #[cfg(all(not(feature = "sim"), feature = "native"))]
+    pub fn new_with_raw_pcm_adm(
+        audio_config: &AudioConfig,
+        use_injectable_network: bool,
+        field_trials_string: &str,
+    ) -> Result<(
+        Self,
+        Arc<Mutex<crate::webrtc::raw_pcm_audio_device_module::RawPcmAudioDeviceModule>>,
+    )> {
+        debug!("PeerConnectionFactory::new_with_raw_pcm_adm()");
+
+        let audio_config_rffi = audio_config.rffi_raw_pcm()?;
+        let raw_pcm_adm = audio_config_rffi
+            .raw_pcm_adm
+            .clone()
+            .ok_or_else(|| anyhow!("Failed to initialize raw pcm adm"))?;
+
+        let field_trials_cstr = CString::new(field_trials_string)?;
+
+        let rffi = unsafe {
+            webrtc::Arc::from_owned(pcf::Rust_createPeerConnectionFactory(
+                webrtc::ptr::Borrowed::from_ptr(&audio_config_rffi.rffi),
+                use_injectable_network,
+                field_trials_cstr.as_ptr(),
+            ))
+        };
+        if rffi.is_null() {
+            return Err(RingRtcError::CreatePeerConnectionFactory.into());
+        }
+        Ok((
+            Self {
+                rffi,
+                #[cfg(feature = "native")]
+                device_counts: Default::default(),
+                adm: None,
+            },
+            raw_pcm_adm,
+        ))
     }
 
     pub fn rffi(&self) -> &webrtc::Arc<RffiPeerConnectionFactoryOwner> {
