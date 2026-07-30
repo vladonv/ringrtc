@@ -94,6 +94,9 @@ pub mod electron;
 #[cfg(feature = "native")]
 pub mod native;
 
+#[cfg(all(not(feature = "sim"), feature = "native"))]
+pub mod cpp_ffi;
+
 #[cfg(all(feature = "virtual_audio", feature = "native", not(feature = "sim")))]
 pub mod virtual_audio;
 
