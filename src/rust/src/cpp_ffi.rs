@@ -554,7 +554,24 @@ pub unsafe extern "C" fn signal2sip_call_start_outgoing(
 /// in-process CallManager's send_offer callback) into the call manager,
 /// which will itself invoke the accept/proceed flow via callbacks.
 ///
-/// Safety: `handle`/`remote_peer_id`/`opaque` must be valid.
+/// `sender_identity_key`/`receiver_identity_key` must each be the raw
+/// 32-byte Curve25519 public key (RingRTC derives real SRTP keys via HKDF
+/// over caller_identity_key||callee_identity_key - Signal_Calling_*_
+/// SRTPKey_KDF, see connection.rs - and needs the bare key, NOT
+/// libsignal's 33-byte serialize() form with the leading type byte; a
+/// real Signal client strips this the same way before calling into
+/// RingRTC, e.g. Android's WebRtcUtil.getPublicKeyBytes()). Passing the
+/// wrong length here doesn't error - it silently derives a different
+/// SRTP key than the real peer, so every media packet fails SRTP auth
+/// despite ICE/DTLS connecting fine (found live in this project's Node
+/// prototype - see project memory). For calls where no real identity key
+/// applies (e.g. the synthetic same-process test), pass a 32-byte all-
+/// zero key on both sides - it still works since both ends derive the
+/// same (fake) shared secret symmetrically.
+///
+/// Safety: `handle`/`remote_peer_id`/`opaque`/`sender_identity_key`/
+/// `receiver_identity_key` must be valid; the two identity key buffers
+/// must each be exactly 32 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signal2sip_call_received_offer(
     handle: *mut CallManagerHandle,
@@ -564,8 +581,10 @@ pub unsafe extern "C" fn signal2sip_call_received_offer(
     receiver_device_id: u32,
     opaque: *const u8,
     opaque_len: usize,
+    sender_identity_key: *const u8,
+    receiver_identity_key: *const u8,
 ) -> bool {
-    if handle.is_null() || opaque.is_null() {
+    if handle.is_null() || opaque.is_null() || sender_identity_key.is_null() || receiver_identity_key.is_null() {
         return false;
     }
     let handle = unsafe { &mut *handle };
@@ -583,8 +602,8 @@ pub unsafe extern "C" fn signal2sip_call_received_offer(
         age: std::time::Duration::from_secs(0),
         sender_device_id,
         receiver_device_id,
-        sender_identity_key: vec![0u8; 32],
-        receiver_identity_key: vec![0u8; 32],
+        sender_identity_key: unsafe { std::slice::from_raw_parts(sender_identity_key, 32) }.to_vec(),
+        receiver_identity_key: unsafe { std::slice::from_raw_parts(receiver_identity_key, 32) }.to_vec(),
     };
     match handle
         .call_manager
@@ -593,6 +612,76 @@ pub unsafe extern "C" fn signal2sip_call_received_offer(
         Ok(()) => true,
         Err(e) => {
             error!("signal2sip_call_received_offer failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Feeds a received hangup message (from a real Signal CallMessage's
+/// `hangup` field, or a peer's own local hangup) into the call manager.
+/// `hangup_type` matches SIGNAL2SIP_HANGUP_* below (mirrors protobuf
+/// CallMessage.Hangup.Type numerically) - device_id is only meaningful
+/// for the *OnAnotherDevice variants (ignored for Normal).
+///
+/// Safety: `handle`/`remote_peer_id` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signal2sip_call_received_hangup(
+    handle: *mut CallManagerHandle,
+    remote_peer_id: *const c_char,
+    call_id: u64,
+    sender_device_id: u32,
+    hangup_type: i32,
+    hangup_device_id: u32,
+) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *handle };
+    let peer_id = cstr_to_string(remote_peer_id);
+    let Some(typ) = signaling::HangupType::from_i32(hangup_type) else {
+        error!("signal2sip_call_received_hangup: bad hangup_type: {}", hangup_type);
+        return false;
+    };
+    let received = signaling::ReceivedHangup {
+        hangup: signaling::Hangup::from_type_and_device_id(typ, hangup_device_id),
+        sender_device_id,
+    };
+    match handle
+        .call_manager
+        .received_hangup(peer_id, CallId::new(call_id), received)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            error!("signal2sip_call_received_hangup failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Feeds a received busy message (from a real Signal CallMessage's `busy`
+/// field) into the call manager.
+///
+/// Safety: `handle`/`remote_peer_id` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signal2sip_call_received_busy(
+    handle: *mut CallManagerHandle,
+    remote_peer_id: *const c_char,
+    call_id: u64,
+    sender_device_id: u32,
+) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *handle };
+    let peer_id = cstr_to_string(remote_peer_id);
+    let received = signaling::ReceivedBusy { sender_device_id };
+    match handle
+        .call_manager
+        .received_busy(peer_id, CallId::new(call_id), received)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            error!("signal2sip_call_received_busy failed: {}", e);
             false
         }
     }
