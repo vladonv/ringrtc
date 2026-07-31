@@ -733,6 +733,58 @@ pub unsafe extern "C" fn signal2sip_call_received_ice(
     }
 }
 
+/// Must be called once the application has finished actually delivering
+/// the most recent signaling message handed to it via a `send_*` callback
+/// (offer/answer/ice/hangup) - RingRTC's own signaling queue serializes
+/// messages per call and will not invoke the next `send_*` callback until
+/// this (or `signal2sip_call_message_send_failure`) is called. Missing
+/// this call is a real bug this project hit: without it, only the very
+/// first signaling message per call (the offer or answer) is ever
+/// delivered - every ICE candidate queues up behind it forever, so the
+/// call gathers candidates but neither side ever learns the other's,
+/// and the call sits in ConnectingBeforeAccepted until RingRTC's own
+/// ~60s CallTimeout ends it. See `assume_messages_sent()` in native.rs -
+/// this project's CallManager is built with `should_assume_messages_sent
+/// = false`, so this call is mandatory, not optional.
+///
+/// Safety: `handle` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signal2sip_call_message_sent(handle: *mut CallManagerHandle, call_id: u64) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *handle };
+    match handle.call_manager.message_sent(CallId::new(call_id)) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("signal2sip_call_message_sent failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Counterpart to `signal2sip_call_message_sent` for when delivery of the
+/// most recent signaling message actually failed (e.g. a real network/HTTP
+/// error sending a Signal CallMessage) - lets RingRTC continue draining its
+/// signaling queue (dropping/skipping that message) instead of stalling
+/// forever the way a missing `message_sent()` call would.
+///
+/// Safety: `handle` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn signal2sip_call_message_send_failure(handle: *mut CallManagerHandle, call_id: u64) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *handle };
+    match handle.call_manager.message_send_failure(CallId::new(call_id)) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("signal2sip_call_message_send_failure failed: {}", e);
+            false
+        }
+    }
+}
+
 /// Local hangup of the currently-active call (RingRTC only tracks one
 /// active call at a time per CallManager - matches this project's
 /// one-process-per-account, one-call-at-a-time scope).
