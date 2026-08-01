@@ -745,7 +745,23 @@ pub unsafe extern "C" fn signal2sip_call_proceed(handle: *mut CallManagerHandle,
     }
 }
 
-/// Safety: `handle`/`remote_peer_id`/`opaque` must be valid.
+/// `sender_identity_key` is the callee's (answer originator's) identity
+/// key, `receiver_identity_key` is the caller's (us, the one receiving
+/// the answer) - same naming convention and same 32-byte raw
+/// (not libsignal's 33-byte serialize() form) Curve25519 requirement as
+/// `signal2sip_call_received_offer`. Getting this wrong doesn't error -
+/// it silently derives the wrong SRTP key, so the caller's ICE connects
+/// fine but never receives a valid `Accepted` RTP-data message from the
+/// callee and eventually hits its own CallTimeout - found live in
+/// Milestone G: this function hardcoded 32 zero bytes here (the same bug
+/// signal2sip_call_received_offer had before it was fixed), so every
+/// outgoing call's caller side derived the wrong key while the callee
+/// side (which did get real keys) worked fine - a real, previously
+/// live, asymmetric "callee connects, caller never does" bug.
+///
+/// Safety: `handle`/`remote_peer_id`/`opaque`/`sender_identity_key`/
+/// `receiver_identity_key` must be valid; the two identity key buffers
+/// must each be exactly 32 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signal2sip_call_received_answer(
     handle: *mut CallManagerHandle,
@@ -754,8 +770,14 @@ pub unsafe extern "C" fn signal2sip_call_received_answer(
     sender_device_id: u32,
     opaque: *const u8,
     opaque_len: usize,
+    sender_identity_key: *const u8,
+    receiver_identity_key: *const u8,
 ) -> bool {
-    if handle.is_null() || opaque.is_null() {
+    if handle.is_null()
+        || opaque.is_null()
+        || sender_identity_key.is_null()
+        || receiver_identity_key.is_null()
+    {
         return false;
     }
     let handle = unsafe { &mut *handle };
@@ -771,8 +793,8 @@ pub unsafe extern "C" fn signal2sip_call_received_answer(
     let received = signaling::ReceivedAnswer {
         answer,
         sender_device_id,
-        sender_identity_key: vec![0u8; 32],
-        receiver_identity_key: vec![0u8; 32],
+        sender_identity_key: unsafe { std::slice::from_raw_parts(sender_identity_key, 32) }.to_vec(),
+        receiver_identity_key: unsafe { std::slice::from_raw_parts(receiver_identity_key, 32) }.to_vec(),
     };
     match handle
         .call_manager
