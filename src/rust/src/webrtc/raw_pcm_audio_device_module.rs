@@ -26,7 +26,7 @@ use std::ffi::{c_uchar, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::webrtc;
 use crate::webrtc::audio_device_module::AudioLayer;
@@ -199,6 +199,15 @@ impl RawPcmAudioDeviceModule {
         let speaker_queue = self.speaker_queue.clone();
         let stop_flag = self.stop_playout_flag.clone();
         self.playout_thread = Some(thread::spawn(move || {
+            // Self-correcting fixed-deadline schedule, matching
+            // RingRtcSipBridge::FeederLoop's sleep_until pattern
+            // (native/voip/ringrtc_sip_bridge.cpp) - a naive
+            // thread::sleep(10ms) after each iteration's work would drift
+            // whenever the FFI call or mutex lock takes longer than usual
+            // (e.g. under real CPU contention from Signal networking/ICE
+            // in the same process), and that drift compounds over the
+            // life of a call instead of self-correcting.
+            let mut next_deadline = Instant::now();
             while !stop_flag.load(Ordering::SeqCst) {
                 let mut data = vec![0i16; WEBRTC_WINDOW];
                 let mut samples_out: usize = 0;
@@ -228,7 +237,10 @@ impl RawPcmAudioDeviceModule {
                         q.pop_front();
                     }
                 }
-                thread::sleep(Duration::from_millis(10));
+                next_deadline += Duration::from_millis(10);
+                if let Some(d) = next_deadline.checked_duration_since(Instant::now()) {
+                    thread::sleep(d);
+                }
             }
         }));
         0
@@ -256,6 +268,9 @@ impl RawPcmAudioDeviceModule {
         let mic_queue = self.mic_queue.clone();
         let stop_flag = self.stop_recording_flag.clone();
         self.recording_thread = Some(thread::spawn(move || {
+            // Self-correcting schedule - see the matching comment in
+            // start_playout() above.
+            let mut next_deadline = Instant::now();
             while !stop_flag.load(Ordering::SeqCst) {
                 let samples: Vec<i16> = {
                     let mut q = mic_queue.lock().unwrap();
@@ -286,7 +301,10 @@ impl RawPcmAudioDeviceModule {
                         -1,
                     )
                 };
-                thread::sleep(Duration::from_millis(10));
+                next_deadline += Duration::from_millis(10);
+                if let Some(d) = next_deadline.checked_duration_since(Instant::now()) {
+                    thread::sleep(d);
+                }
             }
         }));
         0
