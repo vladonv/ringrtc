@@ -248,4 +248,38 @@ unsafe extern "C" {
         elapsed_time_ms: *mut i64,
         ntp_time_ms: *mut i64,
     ) -> i32;
+
+    // Instance-aware siblings of the two functions above, used exclusively
+    // by RawPcmAudioDeviceModule (raw_pcm_audio_device_module.rs) instead
+    // of the plain Rust_recordedDataIsAvailable/Rust_needMorePlayData -
+    // `adm_borrowed` identifies which RawPcmAudioDeviceModule's registered
+    // AudioTransport to use, so multiple concurrent calls (each with their
+    // own RingRTCAudioDeviceModule/CallManager) don't cross audio in one
+    // process. See audio_device.cc's g_raw_pcm_transport_registry.
+    pub fn Rust_rawPcmRecordedDataIsAvailable(
+        adm_borrowed: *mut c_void,
+        audio_samples: *const c_void,
+        n_samples: size_t,
+        n_bytes_per_sample: size_t,
+        n_channels: size_t,
+        samples_per_sec: u32,
+        total_delay_ms: u32,
+        clock_drift: i32,
+        current_mic_level: u32,
+        key_pressed: bool,
+        new_mic_level: *mut u32,
+        estimated_capture_time_ns: i64,
+    ) -> i32;
+
+    pub fn Rust_rawPcmNeedMorePlayData(
+        adm_borrowed: *mut c_void,
+        n_samples: size_t,
+        n_bytes_per_sample: size_t,
+        n_channels: size_t,
+        samples_per_sec: u32,
+        audio_samples: *mut c_void,
+        n_samples_out: *mut size_t,
+        elapsed_time_ms: *mut i64,
+        ntp_time_ms: *mut i64,
+    ) -> i32;
 }

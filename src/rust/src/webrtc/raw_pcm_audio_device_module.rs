@@ -15,11 +15,16 @@
 //! AudioDeviceModule does not).
 //!
 //! This file is purely additive - it does not modify audio_device_module.rs
-//! at all. It drives WebRTC's own `Rust_recordedDataIsAvailable`/
-//! `Rust_needMorePlayData` FFI hooks (declared `pub` in
-//! webrtc::ffi::audio_device_module, called by that file's cubeb-backed
-//! `Worker` too) directly, on its own 10ms timer thread instead of a real
-//! sound device's hardware-driven callback thread.
+//! at all. It drives WebRTC's own `Rust_rawPcmRecordedDataIsAvailable`/
+//! `Rust_rawPcmNeedMorePlayData` FFI hooks (declared `pub` in
+//! webrtc::ffi::audio_device_module) directly, on its own 10ms timer thread
+//! instead of a real sound device's hardware-driven callback thread. These
+//! are instance-aware siblings of the plain `Rust_recordedDataIsAvailable`/
+//! `Rust_needMorePlayData` the cubeb-backed `Worker` uses - each takes this
+//! instance's own `self_ptr` so C++'s audio_device.cc can route to the
+//! right RingRTCAudioDeviceModule's registered AudioTransport when more
+//! than one RawPcmAudioDeviceModule is active in the same process (e.g.
+//! two concurrent signal2sip calls on different accounts).
 
 use std::collections::VecDeque;
 use std::ffi::{c_uchar, c_void};
@@ -30,7 +35,9 @@ use std::time::{Duration, Instant};
 
 use crate::webrtc;
 use crate::webrtc::audio_device_module::AudioLayer;
-use crate::webrtc::ffi::audio_device_module::{Rust_needMorePlayData, Rust_recordedDataIsAvailable};
+use crate::webrtc::ffi::audio_device_module::{
+    Rust_rawPcmNeedMorePlayData, Rust_rawPcmRecordedDataIsAvailable,
+};
 
 const SAMPLE_FREQUENCY: u32 = 48_000;
 const NUM_CHANNELS: u32 = 1;
@@ -77,6 +84,19 @@ pub struct RawPcmAudioDeviceModule {
     recording_thread: Option<JoinHandle<()>>,
     stop_playout_flag: Arc<AtomicBool>,
     stop_recording_flag: Arc<AtomicBool>,
+    // This instance's own `Arc<Mutex<RawPcmAudioDeviceModule>>` address, as
+    // an opaque integer (not a real pointer - avoids requiring Send/Sync
+    // gymnastics for a value that's never dereferenced on the Rust side).
+    // Unknown at construction time (the Arc doesn't exist yet), set once via
+    // set_self_ptr() immediately after PeerConnectionFactory::rffi_raw_pcm()
+    // wraps this instance in its Arc. Needed so start_playout()/
+    // start_recording()'s own threads can identify themselves to
+    // Rust_rawPcmRecordedDataIsAvailable/Rust_rawPcmNeedMorePlayData's
+    // per-instance AudioTransport registry (audio_device.cc) - without
+    // this, two concurrent RawPcmAudioDeviceModule instances (e.g. two
+    // simultaneous signal2sip calls on different accounts) would have no
+    // way to tell C++ which one's registered transport to use.
+    self_ptr: usize,
 }
 
 impl RawPcmAudioDeviceModule {
@@ -92,7 +112,15 @@ impl RawPcmAudioDeviceModule {
             recording_thread: None,
             stop_playout_flag: Arc::new(AtomicBool::new(false)),
             stop_recording_flag: Arc::new(AtomicBool::new(false)),
+            self_ptr: 0,
         })
+    }
+
+    /// Set once by PeerConnectionFactory::rffi_raw_pcm() right after this
+    /// instance is wrapped in its owning Arc - see the `self_ptr` field
+    /// doc comment above for why this two-step construction is necessary.
+    pub(crate) fn set_self_ptr(&mut self, ptr: usize) {
+        self.self_ptr = ptr;
     }
 
     /// Feed PCM samples (mono, 48kHz, i16) to be encoded and sent to the
@@ -198,6 +226,7 @@ impl RawPcmAudioDeviceModule {
         self.stop_playout_flag.store(false, Ordering::SeqCst);
         let speaker_queue = self.speaker_queue.clone();
         let stop_flag = self.stop_playout_flag.clone();
+        let self_ptr = self.self_ptr;
         self.playout_thread = Some(thread::spawn(move || {
             // Self-correcting fixed-deadline schedule, matching
             // RingRtcSipBridge::FeederLoop's sleep_until pattern
@@ -218,7 +247,8 @@ impl RawPcmAudioDeviceModule {
                 // matches Worker::need_more_play_data's own usage of this
                 // same FFI function in audio_device_module.rs.
                 let ret = unsafe {
-                    Rust_needMorePlayData(
+                    Rust_rawPcmNeedMorePlayData(
+                        self_ptr as *mut c_void,
                         WEBRTC_WINDOW,
                         std::mem::size_of::<i16>(),
                         NUM_CHANNELS.try_into().unwrap(),
@@ -267,6 +297,7 @@ impl RawPcmAudioDeviceModule {
         self.stop_recording_flag.store(false, Ordering::SeqCst);
         let mic_queue = self.mic_queue.clone();
         let stop_flag = self.stop_recording_flag.clone();
+        let self_ptr = self.self_ptr;
         self.recording_thread = Some(thread::spawn(move || {
             // Self-correcting schedule - see the matching comment in
             // start_playout() above.
@@ -287,7 +318,8 @@ impl RawPcmAudioDeviceModule {
                 // allocated and this call must not read beyond that;
                 // matches Worker::recorded_data_is_available's own usage.
                 let _ret = unsafe {
-                    Rust_recordedDataIsAvailable(
+                    Rust_rawPcmRecordedDataIsAvailable(
+                        self_ptr as *mut c_void,
                         samples.as_ptr() as *const c_void,
                         samples.len(),
                         std::mem::size_of::<i16>(),

@@ -254,6 +254,15 @@ impl AudioConfig {
         let (adm_borrowed, adm_arc) = match RawPcmAudioDeviceModule::new() {
             Ok(adm) => {
                 let adm_arc = Arc::new(Mutex::new(adm));
+                // The instance doesn't know its own future Arc address at
+                // construction time - record it now (Arc::as_ptr doesn't
+                // touch the refcount, unlike into_raw below) so
+                // start_playout()/start_recording() can later identify
+                // this instance to audio_device.cc's per-instance
+                // AudioTransport registry. See RawPcmAudioDeviceModule's
+                // `self_ptr` field doc comment.
+                let self_ptr = Arc::as_ptr(&adm_arc) as usize;
+                adm_arc.lock().unwrap().set_self_ptr(self_ptr);
                 (
                     webrtc::ptr::Borrowed::from_ptr(Arc::<Mutex<RawPcmAudioDeviceModule>>::into_raw(
                         adm_arc.clone(),
