@@ -5,7 +5,7 @@
 
 solutions = [
   { "name"        : "src",
-    "url"         : "https://github.com/signalapp/webrtc.git",
+    "url"         : "https://github.com/vladonv/webrtc.git",
     "deps_file"   : "DEPS",
   },
 ]
