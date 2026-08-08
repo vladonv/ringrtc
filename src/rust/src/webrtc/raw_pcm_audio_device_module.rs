@@ -44,9 +44,45 @@ const NUM_CHANNELS: u32 = 1;
 // WebRTC always expects to provide/consume 10ms of samples at a time,
 // matching audio_device_module.rs's WEBRTC_WINDOW.
 const WEBRTC_WINDOW: usize = (SAMPLE_FREQUENCY / 100) as usize;
-// Cap queued-but-unconsumed audio at 2s so a native side that stops
-// pulling/pushing doesn't grow these queues unbounded.
-const MAX_QUEUED_SAMPLES: usize = SAMPLE_FREQUENCY as usize * 2;
+// Cap speaker_queue (playout - decoded remote audio waiting to be pulled
+// out to SIP) at a small real-time target latency, NOT a generous "don't
+// grow forever" backstop - found live 2026-08-06 that a 2s cap (this
+// constant's old, shared-with-mic_queue value) was itself the bug:
+// signal2sip's SIP bridge (native/voip/ringrtc_sip_bridge.cpp) only
+// starts draining speaker_queue via pull_playout_samples() once
+// wireBridgeAudio() runs (gated on the PBX side actually answering - see
+// BridgeCall's own doc comment in main.cpp), but start_playout()'s thread
+// below starts buffering into speaker_queue as soon as WebRTC's own call/
+// audio pipeline connects, which can happen well before that (e.g. while
+// the PBX side is still ringing). Nothing here ever "catches up" once
+// behind - both this queue and the ring buffer downstream are plain
+// FIFOs with no rate mismatch between producer/consumer, so whatever
+// backlog builds up before the SIP side starts draining becomes a FIXED,
+// permanent delay for the rest of the call (confirmed live: ~1-1.5s of
+// audible SIP-bound audio lag). Trimming from the front (oldest first,
+// same policy as before) whenever this cap is exceeded keeps latency
+// bounded indefinitely, self-healing regardless of the exact cause of any
+// given lag spike - not just the startup race above.
+const MAX_QUEUED_PLAYOUT_SAMPLES: usize = SAMPLE_FREQUENCY as usize / 10; // 100ms
+
+// mic_queue (recorded SIP audio waiting to be pushed into WebRTC) does
+// NOT get the same tight cap - found live 2026-08-06 that applying
+// MAX_QUEUED_PLAYOUT_SAMPLES' 100ms cap here too (this constant used to
+// be shared between both queues) caused brief, audible dropouts on real
+// calls ("пропадаю на доли секунды", confirmed by a real remote Signal-
+// iOS caller): unlike speaker_queue, this direction never had a startup-
+// backlog problem in the first place (SoftwareAudioInput::PutFrameCallback
+// in audio_bridge.cpp already discards everything arriving before
+// Start(), so nothing pre-buffers here before the bridge is ready) - the
+// only effect of a tight cap here is to actively DISCARD real,
+// never-yet-sent audio the moment a normal, harmless scheduling/jitter
+// hiccup lets more than 100ms build up momentarily (e.g. the OS briefly
+// deprioritizing this thread under load), which is a genuine data loss,
+// not just added latency. Keep a much more generous cap - this queue is
+// only meant to protect against a native side that stops pulling
+// entirely (see push_recorded_samples()'s own doc comment), not to
+// enforce a tight real-time target.
+const MAX_QUEUED_MIC_SAMPLES: usize = SAMPLE_FREQUENCY as usize * 2; // 2s
 
 fn write_bool(mut ptr: webrtc::ptr::Borrowed<bool>, v: bool) -> i32 {
     match unsafe { ptr.as_mut() } {
@@ -128,7 +164,7 @@ impl RawPcmAudioDeviceModule {
     pub fn push_recorded_samples(&self, samples: &[i16]) {
         let mut q = self.mic_queue.lock().unwrap();
         q.extend(samples.iter().copied());
-        while q.len() > MAX_QUEUED_SAMPLES {
+        while q.len() > MAX_QUEUED_MIC_SAMPLES {
             q.pop_front();
         }
     }
@@ -263,7 +299,7 @@ impl RawPcmAudioDeviceModule {
                     data.truncate(samples_out);
                     let mut q = speaker_queue.lock().unwrap();
                     q.extend(data);
-                    while q.len() > MAX_QUEUED_SAMPLES {
+                    while q.len() > MAX_QUEUED_PLAYOUT_SAMPLES {
                         q.pop_front();
                     }
                 }
